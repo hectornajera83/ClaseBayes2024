@@ -1,0 +1,197 @@
+---
+title: "BRMSSTAN"
+author: "Hector Najera"
+date: "2024-05-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(pacman)
+p_load(brms,rstan,cmdstanr,dplyr,haven, posterior, tidybayes, fastDummies)
+library(brms)
+library(sn)
+library(ggplot2)
+library(gridExtra)
+```
+
+
+# BRMS: Estimación con distribuciones espciales
+
+En algunas ocasiones la distribución que necesitamos es difícil de modelar debido a los sesgos, anchura, multimodalidad. En estos casos es necesario utilizar alguna distribución especial. 
+
+```{r}
+NObs     <- 1500
+Sigma    <- 1
+Mu       <- 1
+Nu       <- 2 
+Alpha    <- 2
+Iter     <- 1500
+WarmUp   <- 400
+
+Data <- data.frame(Response = rst(NObs, xi=Mu, omega = Sigma, alpha=Alpha, nu=Nu))
+```
+
+```{r}
+hist(Data$Response)
+```
+
+# Primero vamos a estimar el modelo bajo una normal
+
+```{r}
+M0 <- brm(Response ~ 1, family = gaussian(), 
+                 data = Data, warmup = WarmUp, iter = Iter)
+pp_check(M0)
+```
+
+# Especificación 
+
+Primero tenemos que crear nuestra distribución de la familia skew_student_t. Esta distribución tiene un parámetro extra "alpha". 
+
+Posteriormente creamos la función que debera leer brms desde stan
+
+```{r}
+skew_student_t <- custom_family(
+  name = "skew_student_t", dpars = c("mu", "nu","sigma", "alpha"),
+  links = "identity", lb = c(NA, 1, 0, NA),
+  type = "real")
+
+StanFuncs <- "
+
+real skew_student_t_lpdf(real y, real mu, real nu, real sigma, real alpha) {
+
+return log(2) + student_t_lpdf(y | nu, mu, sigma) + student_t_lcdf((y - mu)/sigma * alpha | nu,0, 1);
+
+}
+
+
+real skew_student_t_rng(real mu, real nu, real sigma, real alpha) {
+
+real z = skew_normal_rng(0, sigma, alpha);
+real v = chi_square_rng(nu)/nu;  
+real y = mu + z/sqrt(v);
+
+return y;
+
+}
+
+"
+# ........................................................................................ Stan vars   
+
+StanVars <- stanvar(scode = StanFuncs, block = "functions")
+```
+
+# Estimación
+
+La función expose_functions nos va a permitir poder hacer chequeos posteriores del modelo. Recuerda que brms no tiene todos los ingredientes para procesar las posteriores. 
+
+```{r}
+M0_SkewT <- brm(Response ~ 1, family = skew_student_t, 
+                 data = Data, stanvars = StanVars, warmup = WarmUp, iter = Iter)
+
+expose_functions(M0_SkewT, vectorize = TRUE)
+
+posterior_predict_skew_student_t <- function(i, draws, ...) {
+  
+  mu    <- draws$dpars$mu[, i]
+  sigma <- draws$dpars$sigma
+  nu    <- draws$dpars$nu
+  alpha <- draws$dpars$alpha
+  
+  skew_student_t_rng(mu, nu, sigma, alpha)
+}
+
+PC_Dens_Ori <- pp_check(M0ICTPC_st, nsamples = NSamples)
+PC_Dens_Lim <- PC_Dens_Ori + xlim(XLim)
+PC_Hist_Ori <- pp_check(M0ICTPC_st, type = "hist", nsamples = NSamples, binwidth = 0.1)
+PC_Hist_Lim <- PC_Hist_Ori + xlim(XLim)
+
+ListPCPlots <- list(PC_Dens_Ori, PC_Hist_Ori, PC_Dens_Lim, PC_Hist_Lim)
+PlotGrid <- grid.arrange(grobs = ListPCPlots,  ncol = NCol) 
+
+ggsave(filename = paste0(quote(M0ICTPC_st), "_", quote(PlotGrid), Extension), plot = PlotGrid,
+       width = Width, height = Height, units = Units)
+
+```
+
+# Ejemplo con la ENIGH
+
+```{r}
+D<-read_dta("pobreza_18.dta")
+```
+
+## Transformación boxcox del ictpc. Para ello se necesita el paquete `sae`.
+
+```{r}
+library(sae)
+D$ictpc.bxcx<-bxcx(D$ictpc, lambda = 0.1010101, InverseQ = FALSE)
+Ds<-sample_frac(D,.25)
+```
+
+Miramos la distribución transformada
+
+```{r}
+hist(Ds$ictpc.bxcx)
+```
+
+# Estimamos el modelo con la ENIGH
+
+```{r}
+library(brms)
+library(sn)
+library(ggplot2)
+library(gridExtra)
+
+skew_student_t <- custom_family(
+  name = "skew_student_t", dpars = c("mu", "nu","sigma", "alpha"),
+  links = "identity", lb = c(NA, 1, 0, NA),
+  type = "real")
+StanFuncs <- "
+
+real skew_student_t_lpdf(real y, real mu, real nu, real sigma, real alpha) {
+
+return log(2) + student_t_lpdf(y | nu, mu, sigma) + student_t_lcdf((y - mu)/sigma * alpha | nu,0, 1);
+
+}
+
+
+real skew_student_t_rng(real mu, real nu, real sigma, real alpha) {
+
+real z = skew_normal_rng(0, sigma, alpha);
+real v = chi_square_rng(nu)/nu;  
+real y = mu + z/sqrt(v);
+
+return y;
+
+}
+
+"
+
+StanVars <- stanvar(scode = StanFuncs, block = "functions")
+
+priors <- c(prior("normal(0,2)", class = "b"),
+              #prior("student_t(5,0,1)", class = "b", coef="salario"),
+              #prior("student_t(6,0,1)", class = "b", coef="i_noref"),
+               #prior("inv_gamma(1,1)", class = "sd"),
+              prior("normal(0,2.5)", class = "sd"),
+              prior("normal(0,2.5)", class = "sigma"))
+
+M0_SkewT <- brm(bf(ictpc.bxcx ~ 1 + tamhogesc + tam_loc), family = skew_student_t, 
+                 data = Ds, stanvars = StanVars,
+                 warmup = 400, iter = 1200, chains=2, 
+                threads = threading(14, grainsize = 100),backend = "cmdstanr")
+
+```
+
+# Posterior predictive checks
+
+```{r}
+PC_Dens_Ori <- pp_check(M0_SkewT, nsamples = NSamples)
+PC_Dens_Lim <- PC_Dens_Ori + xlim(XLim)
+PC_Hist_Ori <- pp_check(M0_SkewT, type = "hist", nsamples = NSamples, binwidth = 0.1)
+PC_Hist_Lim <- PC_Hist_Ori + xlim(XLim)
+```
+
+## Ejercicio estimar el mismo modelo tomando el logaritmo o usando lognormal y comparar los resultados. 
+
+
